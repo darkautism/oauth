@@ -115,23 +115,6 @@ Everything inside that database is private implementation state of this crate. A
 
 When a future crate version changes its schema, `OAuthState::open` applies the embedded migrations before serving requests.
 
-### Migrating an older embedded OAuth database
-
-If an older version of your application stored OAuth tables inside its own SQLite database, use the one-time migration constructor during the upgrade:
-
-```rust
-let oauth_state = OAuthState::open_migrating_legacy(
-    "./data/oauth.db",
-    config,
-    &old_application_pool,
-)
-.await?;
-```
-
-The old database is read-only from this migration's point of view. Existing OAuth rows are copied transactionally into the new private database, and the import is marked complete only after every table succeeds. The old rows are left untouched so a failed upgrade does not destroy the source data.
-
-After a successful import, later starts use only the private OAuth database.
-
 ## Redirect policies
 
 ### `RedirectPolicy::PublicMcp`

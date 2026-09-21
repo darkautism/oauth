@@ -1,4 +1,0 @@
-CREATE TABLE IF NOT EXISTS oauth_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
