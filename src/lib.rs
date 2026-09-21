@@ -250,7 +250,9 @@ async fn protected_resource_metadata_root(
     headers: HeaderMap,
 ) -> Json<Value> {
     let origin = issuer(&state, &headers);
-    protected_resource_metadata_response(format!("{origin}/"), origin, &state.config.scope)
+    // MCPX keeps one canonical protected resource even when a compatibility
+    // root endpoint is reachable: the MCP resource is always {origin}/mcp.
+    protected_resource_metadata_response(format!("{origin}/mcp"), origin, &state.config.scope)
 }
 
 async fn protected_resource_metadata_mcp(
@@ -657,6 +659,40 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     (segments[0] & 0xe000) == 0x2000
 }
 
+fn client_redirect_allowed(client_id: &str, client: &ResolvedClient, redirect_uri: &str) -> bool {
+    if client.redirect_uris.iter().any(|uri| uri == redirect_uri) {
+        return true;
+    }
+    if !is_cimd_client_id(client_id) {
+        return false;
+    }
+
+    let Ok(url) = Url::parse(redirect_uri) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+
+    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return false;
+    };
+    if !matches!(
+        host.as_str(),
+        "chatgpt.com" | "www.chatgpt.com" | "chat.openai.com"
+    ) {
+        return false;
+    }
+
+    let path = url.path();
+    path == "/connector_platform_oauth_redirect"
+        || (path.starts_with("/connector/oauth/") && path.len() > "/connector/oauth/".len())
+}
+
 async fn resolve_client(state: &OAuthState, client_id: &str) -> Result<ResolvedClient, String> {
     let row = sqlx::query(
         "SELECT redirect_uris,token_endpoint_auth_method,client_secret_hash FROM oauth_clients WHERE client_id=?",
@@ -852,11 +888,7 @@ async fn validate_authorize(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    if !client
-        .redirect_uris
-        .iter()
-        .any(|uri| uri == &params.redirect_uri)
-    {
+    if !client_redirect_allowed(&params.client_id, &client, &params.redirect_uri) {
         return Err((
             StatusCode::BAD_REQUEST,
             "redirect_uri is not registered".into(),
@@ -1140,12 +1172,10 @@ pub async fn require_mcp_auth(
     next: Next,
 ) -> Response {
     let origin = issuer(&state, &headers);
-    let root_resource = request.uri().path() == "/";
-    let resource = if root_resource {
-        format!("{origin}/")
-    } else {
-        format!("{origin}/mcp")
-    };
+    // Match MCPX: the protected resource identity is always /mcp. A root
+    // route may remain as a compatibility alias, but it must not mint or
+    // validate a second OAuth audience.
+    let resource = format!("{origin}/mcp");
 
     let token = headers
         .get(header::AUTHORIZATION)
@@ -1158,11 +1188,7 @@ pub async fn require_mcp_auth(
     };
 
     if !valid {
-        let metadata = if root_resource {
-            format!("{origin}/.well-known/oauth-protected-resource")
-        } else {
-            format!("{origin}/.well-known/oauth-protected-resource/mcp")
-        };
+        let metadata = format!("{origin}/.well-known/oauth-protected-resource/mcp");
 
         return (
             StatusCode::UNAUTHORIZED,
@@ -1364,13 +1390,60 @@ mod tests {
         assert!(!valid_redirect_uri(&state, "http://127.0.0.1:1455/cb"));
     }
 
+    #[tokio::test]
+    async fn root_metadata_uses_the_canonical_mcp_resource() {
+        let state = Arc::new(state(Some("https://pc.example"), RedirectPolicy::PublicMcp));
+        let Json(metadata) =
+            protected_resource_metadata_root(Extension(state), HeaderMap::new()).await;
+        assert_eq!(
+            metadata.get("resource").and_then(Value::as_str),
+            Some("https://pc.example/mcp")
+        );
+    }
+
+    #[test]
+    fn chatgpt_cimd_accepts_path_scoped_connector_callbacks() {
+        let client = ResolvedClient {
+            redirect_uris: vec!["https://chatgpt.com/connector_platform_oauth_redirect".into()],
+            auth_method: "none".into(),
+            secret_hash: None,
+        };
+        let client_id = "https://chatgpt.com/oauth/example/client.json";
+        assert!(client_redirect_allowed(
+            client_id,
+            &client,
+            "https://chatgpt.com/connector/oauth/callback-id"
+        ));
+        assert!(client_redirect_allowed(
+            client_id,
+            &client,
+            "https://chat.openai.com/connector/oauth/callback-id"
+        ));
+        assert!(!client_redirect_allowed(
+            client_id,
+            &client,
+            "https://example.com/connector/oauth/callback-id"
+        ));
+        assert!(!client_redirect_allowed(
+            "opaque-client",
+            &client,
+            "https://chatgpt.com/connector/oauth/callback-id"
+        ));
+    }
+
     #[test]
     fn cimd_ids_require_https_metadata_documents() {
-        assert!(is_cimd_client_id("https://chatgpt.com/oauth/example/client.json"));
-        assert!(!is_cimd_client_id("http://chatgpt.com/oauth/example/client.json"));
+        assert!(is_cimd_client_id(
+            "https://chatgpt.com/oauth/example/client.json"
+        ));
+        assert!(!is_cimd_client_id(
+            "http://chatgpt.com/oauth/example/client.json"
+        ));
         assert!(!is_cimd_client_id("https://chatgpt.com/"));
         assert!(!is_cimd_client_id("opaque-client-id"));
-        assert!(!is_cimd_client_id("https://user@chatgpt.com/oauth/example/client.json"));
+        assert!(!is_cimd_client_id(
+            "https://user@chatgpt.com/oauth/example/client.json"
+        ));
     }
 
     #[test]
@@ -1389,7 +1462,10 @@ mod tests {
             "fe80::1",
             "2001:db8::1",
         ] {
-            assert!(!is_public_ip(raw.parse().unwrap()), "{raw} must be rejected");
+            assert!(
+                !is_public_ip(raw.parse().unwrap()),
+                "{raw} must be rejected"
+            );
         }
         assert!(is_public_ip("1.1.1.1".parse().unwrap()));
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
