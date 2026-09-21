@@ -9,6 +9,7 @@ It provides the OAuth pieces an MCP server commonly needs without making the app
 - OAuth authorization-server metadata
 - MCP protected-resource metadata
 - Dynamic Client Registration
+- Client ID Metadata Documents (CIMD) with public-endpoint SSRF protection
 - Authorization Code flow with PKCE `S256`
 - Refresh tokens
 - Bearer-token validation for MCP routes
@@ -186,7 +187,7 @@ The resolver is consulted only when a client ID is not found in the crate's loca
 | `default_host` | Fallback host when no public URL is configured |
 | `token_prefixes` | Prefixes used for generated IDs and tokens |
 | `redirect_policy` | Redirect-URI validation policy |
-| `client_id_metadata_document_supported` | Advertise external client metadata support |
+| `client_id_metadata_document_supported` | Enable and advertise HTTPS Client ID Metadata Documents (CIMD); an external resolver may override resolution |
 
 ## Token lifetimes
 

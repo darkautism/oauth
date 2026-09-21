@@ -1,4 +1,9 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::Path,
+    sync::Arc,
+    time::Duration as StdDuration,
+};
 
 use axum::{
     Json, Router,
@@ -13,6 +18,10 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use chrono::{DateTime, Duration, Utc};
+use reqwest::{
+    header::{ACCEPT, LOCATION},
+    redirect::Policy,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -20,6 +29,7 @@ use sqlx::{
     Row,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
+use tokio::net::lookup_host;
 use url::Url;
 use uuid::Uuid;
 
@@ -413,6 +423,240 @@ fn host_allowed(production: bool, allowed_hosts: &[String], host: &str) -> bool 
     })
 }
 
+const MAX_CIMD_BODY: usize = 1 << 20;
+const MAX_CIMD_REDIRECTS: usize = 8;
+
+#[derive(Debug, Deserialize)]
+struct ClientMetadataDocument {
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    redirect_uris: Vec<String>,
+    #[serde(default)]
+    token_endpoint_auth_method: String,
+    #[serde(default)]
+    token_endpoint_auth_methods_supported: Vec<String>,
+}
+
+fn is_cimd_client_id(client_id: &str) -> bool {
+    if client_id.is_empty() || client_id.len() > 2048 {
+        return false;
+    }
+    let Ok(url) = Url::parse(client_id) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.path() != "/"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+}
+
+async fn resolve_cimd_client(
+    state: &OAuthState,
+    client_id: &str,
+) -> Result<ResolvedClient, String> {
+    if !is_cimd_client_id(client_id) {
+        return Err("client_id is not an HTTPS metadata document URL".into());
+    }
+
+    let mut current = Url::parse(client_id).map_err(|e| format!("parse CIMD URL: {e}"))?;
+    let mut response = None;
+    for redirects in 0..=MAX_CIMD_REDIRECTS {
+        validate_public_cimd_url(&current)?;
+        let endpoint = resolve_public_endpoint(&current).await?;
+        let host = current
+            .host_str()
+            .ok_or_else(|| "CIMD URL has no host".to_string())?;
+
+        let mut builder = reqwest::Client::builder()
+            .timeout(StdDuration::from_secs(10))
+            .redirect(Policy::none());
+        if host.parse::<IpAddr>().is_err() {
+            builder = builder.resolve(host, endpoint);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| format!("build CIMD client: {e}"))?;
+        let resp = client
+            .get(current.clone())
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("fetch CIMD: {e}"))?;
+
+        if resp.status().is_redirection() {
+            if redirects >= MAX_CIMD_REDIRECTS {
+                return Err("too many CIMD redirects".into());
+            }
+            let location = resp
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "CIMD redirect lacks Location".to_string())?;
+            current = current
+                .join(location)
+                .map_err(|e| format!("invalid CIMD redirect: {e}"))?;
+            continue;
+        }
+        response = Some(resp);
+        break;
+    }
+
+    let mut response = response.ok_or_else(|| "CIMD redirect limit exceeded".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("fetch CIMD: HTTP {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_CIMD_BODY as u64)
+    {
+        return Err("CIMD document exceeds size limit".into());
+    }
+    let mut raw = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("read CIMD: {e}"))?
+    {
+        if raw.len() + chunk.len() > MAX_CIMD_BODY {
+            return Err("CIMD document exceeds size limit".into());
+        }
+        raw.extend_from_slice(&chunk);
+    }
+
+    let doc: ClientMetadataDocument =
+        serde_json::from_slice(&raw).map_err(|e| format!("parse CIMD: {e}"))?;
+    if !doc.client_id.is_empty() && doc.client_id != client_id {
+        return Err("CIMD client_id mismatch".into());
+    }
+    if doc.redirect_uris.is_empty()
+        || doc
+            .redirect_uris
+            .iter()
+            .any(|uri| !valid_redirect_uri(state, uri))
+    {
+        return Err("CIMD contains redirect_uris rejected by policy".into());
+    }
+
+    let mut method = doc.token_endpoint_auth_method.trim().to_string();
+    if method.is_empty()
+        && doc
+            .token_endpoint_auth_methods_supported
+            .iter()
+            .any(|candidate| candidate == "none")
+    {
+        method = "none".into();
+    }
+    if method.is_empty() {
+        method = "none".into();
+    }
+    if method != "none" {
+        if doc
+            .token_endpoint_auth_methods_supported
+            .iter()
+            .any(|candidate| candidate == "none")
+        {
+            method = "none".into();
+        } else {
+            return Err(format!(
+                "unsupported CIMD token_endpoint_auth_method {method:?}"
+            ));
+        }
+    }
+
+    Ok(ResolvedClient {
+        redirect_uris: doc.redirect_uris,
+        auth_method: method,
+        secret_hash: None,
+    })
+}
+
+fn validate_public_cimd_url(url: &Url) -> Result<(), String> {
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_none()
+    {
+        return Err("CIMD URL is not allowed".into());
+    }
+    Ok(())
+}
+
+async fn resolve_public_endpoint(url: &Url) -> Result<SocketAddr, String> {
+    validate_public_cimd_url(url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "CIMD URL has no host".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "CIMD URL has no usable port".to_string())?;
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !is_public_ip(ip) {
+            return Err("CIMD address is not public".into());
+        }
+        return Ok(SocketAddr::new(ip, port));
+    }
+
+    let addrs = lookup_host((host, port))
+        .await
+        .map_err(|e| format!("resolve CIMD host: {e}"))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err("CIMD host resolved to no addresses".into());
+    }
+    if addrs.iter().any(|addr| !is_public_ip(addr.ip())) {
+        return Err("CIMD host resolved to a private or special-use address".into());
+    }
+    Ok(addrs[0])
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_v4(ip),
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_public_v4(v4);
+            }
+            is_public_v6(ip)
+        }
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn is_public_v6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    if (segments[0] & 0xfe00) == 0xfc00 || (segments[0] & 0xffc0) == 0xfe80 {
+        return false;
+    }
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return false;
+    }
+    (segments[0] & 0xe000) == 0x2000
+}
+
 async fn resolve_client(state: &OAuthState, client_id: &str) -> Result<ResolvedClient, String> {
     let row = sqlx::query(
         "SELECT redirect_uris,token_endpoint_auth_method,client_secret_hash FROM oauth_clients WHERE client_id=?",
@@ -444,6 +688,10 @@ async fn resolve_client(state: &OAuthState, client_id: &str) -> Result<ResolvedC
         if let Some(client) = resolver.resolve(client_id).await? {
             return Ok(client);
         }
+    }
+
+    if state.config.client_id_metadata_document_supported && is_cimd_client_id(client_id) {
+        return resolve_cimd_client(state, client_id).await;
     }
 
     Err("unknown client".into())
@@ -1114,6 +1362,37 @@ mod tests {
         assert!(!valid_redirect_uri(&state, "https://trusted.example/cb"));
         assert!(!valid_redirect_uri(&state, "https://evil.example/cb"));
         assert!(!valid_redirect_uri(&state, "http://127.0.0.1:1455/cb"));
+    }
+
+    #[test]
+    fn cimd_ids_require_https_metadata_documents() {
+        assert!(is_cimd_client_id("https://chatgpt.com/oauth/example/client.json"));
+        assert!(!is_cimd_client_id("http://chatgpt.com/oauth/example/client.json"));
+        assert!(!is_cimd_client_id("https://chatgpt.com/"));
+        assert!(!is_cimd_client_id("opaque-client-id"));
+        assert!(!is_cimd_client_id("https://user@chatgpt.com/oauth/example/client.json"));
+    }
+
+    #[test]
+    fn cimd_fetch_rejects_private_and_special_addresses() {
+        for raw in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+        ] {
+            assert!(!is_public_ip(raw.parse().unwrap()), "{raw} must be rejected");
+        }
+        assert!(is_public_ip("1.1.1.1".parse().unwrap()));
+        assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
     }
 
     #[tokio::test]
