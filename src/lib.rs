@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -16,7 +16,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{
+    Row,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -80,18 +83,62 @@ pub trait ExternalClientResolver: Send + Sync {
 }
 
 pub struct OAuthState {
-    pub db: sqlx::SqlitePool,
+    db: sqlx::SqlitePool,
     pub config: OAuthConfig,
     pub external_client_resolver: Option<Arc<dyn ExternalClientResolver>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    #[error("create OAuth database directory: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("open OAuth database: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("migrate OAuth database: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+}
+
 impl OAuthState {
-    pub fn new(db: sqlx::SqlitePool, config: OAuthConfig) -> Self {
-        Self {
+    /// Open the crate-owned SQLite database at the requested path.
+    /// Missing parent directories and the database file are created automatically.
+    /// Schema migrations are embedded in this crate and run on every open.
+    pub async fn open(path: impl AsRef<Path>, config: OAuthConfig) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let db = SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect_with(options)
+            .await?;
+        sqlx::migrate!("./migrations").run(&db).await?;
+
+        Ok(Self {
             db,
             config,
             external_client_resolver: None,
-        }
+        })
+    }
+
+    /// Open a crate-owned database and import OAuth rows from a legacy application
+    /// database exactly once. The source database is never modified.
+    pub async fn open_migrating_legacy(
+        path: impl AsRef<Path>,
+        config: OAuthConfig,
+        legacy_db: &sqlx::SqlitePool,
+    ) -> Result<Self, StorageError> {
+        let state = Self::open(path, config).await?;
+        state.import_legacy_once(legacy_db).await?;
+        Ok(state)
     }
 
     pub fn with_external_client_resolver(
@@ -101,6 +148,153 @@ impl OAuthState {
         self.external_client_resolver = Some(resolver);
         self
     }
+
+    async fn import_legacy_once(&self, legacy_db: &sqlx::SqlitePool) -> Result<(), StorageError> {
+        let imported: Option<String> =
+            sqlx::query_scalar("SELECT value FROM oauth_meta WHERE key='legacy_import_complete'")
+                .fetch_optional(&self.db)
+                .await?;
+        if imported.as_deref() == Some("1") {
+            return Ok(());
+        }
+
+        let mut tx = self.db.begin().await?;
+        copy_legacy_clients(legacy_db, &mut tx).await?;
+        copy_legacy_codes(legacy_db, &mut tx).await?;
+        copy_legacy_refresh_tokens(legacy_db, &mut tx).await?;
+        copy_legacy_access_tokens(legacy_db, &mut tx).await?;
+        sqlx::query(
+            "INSERT INTO oauth_meta(key,value) VALUES('legacy_import_complete','1') ON CONFLICT(key) DO UPDATE SET value='1'",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+async fn legacy_table_exists(db: &sqlx::SqlitePool, table: &str) -> Result<bool, sqlx::Error> {
+    let exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1")
+            .bind(table)
+            .fetch_optional(db)
+            .await?;
+    Ok(exists.is_some())
+}
+
+async fn copy_legacy_clients(
+    source: &sqlx::SqlitePool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), sqlx::Error> {
+    if !legacy_table_exists(source, "oauth_clients").await? {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT client_id,client_secret_hash,redirect_uris,token_endpoint_auth_method,client_name,created_at FROM oauth_clients",
+    )
+    .fetch_all(source)
+    .await?;
+    for row in rows {
+        sqlx::query(
+            "INSERT OR IGNORE INTO oauth_clients(client_id,client_secret_hash,redirect_uris,token_endpoint_auth_method,client_name,created_at) VALUES(?,?,?,?,?,?)",
+        )
+        .bind(row.try_get::<String, _>("client_id")?)
+        .bind(row.try_get::<Option<String>, _>("client_secret_hash")?)
+        .bind(row.try_get::<String, _>("redirect_uris")?)
+        .bind(row.try_get::<String, _>("token_endpoint_auth_method")?)
+        .bind(row.try_get::<Option<String>, _>("client_name")?)
+        .bind(row.try_get::<String, _>("created_at")?)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn copy_legacy_codes(
+    source: &sqlx::SqlitePool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), sqlx::Error> {
+    if !legacy_table_exists(source, "oauth_codes").await? {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT code_hash,client_id,redirect_uri,code_challenge,resource,scope,expires_at,used FROM oauth_codes",
+    )
+    .fetch_all(source)
+    .await?;
+    for row in rows {
+        sqlx::query(
+            "INSERT OR IGNORE INTO oauth_codes(code_hash,client_id,redirect_uri,code_challenge,resource,scope,expires_at,used) VALUES(?,?,?,?,?,?,?,?)",
+        )
+        .bind(row.try_get::<String, _>("code_hash")?)
+        .bind(row.try_get::<String, _>("client_id")?)
+        .bind(row.try_get::<String, _>("redirect_uri")?)
+        .bind(row.try_get::<String, _>("code_challenge")?)
+        .bind(row.try_get::<String, _>("resource")?)
+        .bind(row.try_get::<String, _>("scope")?)
+        .bind(row.try_get::<String, _>("expires_at")?)
+        .bind(row.try_get::<i64, _>("used")?)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn copy_legacy_refresh_tokens(
+    source: &sqlx::SqlitePool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), sqlx::Error> {
+    if !legacy_table_exists(source, "oauth_refresh_tokens").await? {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT token_hash,client_id,resource,scope,expires_at,revoked FROM oauth_refresh_tokens",
+    )
+    .fetch_all(source)
+    .await?;
+    for row in rows {
+        sqlx::query(
+            "INSERT OR IGNORE INTO oauth_refresh_tokens(token_hash,client_id,resource,scope,expires_at,revoked) VALUES(?,?,?,?,?,?)",
+        )
+        .bind(row.try_get::<String, _>("token_hash")?)
+        .bind(row.try_get::<String, _>("client_id")?)
+        .bind(row.try_get::<String, _>("resource")?)
+        .bind(row.try_get::<String, _>("scope")?)
+        .bind(row.try_get::<String, _>("expires_at")?)
+        .bind(row.try_get::<i64, _>("revoked")?)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn copy_legacy_access_tokens(
+    source: &sqlx::SqlitePool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), sqlx::Error> {
+    if !legacy_table_exists(source, "oauth_access_tokens").await? {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT token_hash,client_id,resource,scope,expires_at,revoked,created_at FROM oauth_access_tokens",
+    )
+    .fetch_all(source)
+    .await?;
+    for row in rows {
+        sqlx::query(
+            "INSERT OR IGNORE INTO oauth_access_tokens(token_hash,client_id,resource,scope,expires_at,revoked,created_at) VALUES(?,?,?,?,?,?,?)",
+        )
+        .bind(row.try_get::<String, _>("token_hash")?)
+        .bind(row.try_get::<String, _>("client_id")?)
+        .bind(row.try_get::<String, _>("resource")?)
+        .bind(row.try_get::<String, _>("scope")?)
+        .bind(row.try_get::<String, _>("expires_at")?)
+        .bind(row.try_get::<i64, _>("revoked")?)
+        .bind(row.try_get::<String, _>("created_at")?)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 const ACCESS_TTL_SECS: i64 = 3600;
@@ -990,21 +1184,26 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
 
+    fn config(public_url: Option<&str>, redirect_policy: RedirectPolicy) -> OAuthConfig {
+        OAuthConfig {
+            service_name: "Test".into(),
+            scope: "test".into(),
+            public_url: public_url.map(str::to_string),
+            oauth_password: None,
+            default_host: "127.0.0.1:9999".into(),
+            token_prefixes: TokenPrefixes::new("t"),
+            redirect_policy,
+            client_id_metadata_document_supported: true,
+        }
+    }
+
     fn state(public_url: Option<&str>, redirect_policy: RedirectPolicy) -> OAuthState {
         let db = sqlx::SqlitePool::connect_lazy("sqlite::memory:").expect("lazy sqlite");
-        OAuthState::new(
+        OAuthState {
             db,
-            OAuthConfig {
-                service_name: "Test".into(),
-                scope: "test".into(),
-                public_url: public_url.map(str::to_string),
-                oauth_password: None,
-                default_host: "127.0.0.1:9999".into(),
-                token_prefixes: TokenPrefixes::new("t"),
-                redirect_policy,
-                client_id_metadata_document_supported: true,
-            },
-        )
+            config: config(public_url, redirect_policy),
+            external_client_resolver: None,
+        }
     }
 
     #[tokio::test]
@@ -1074,5 +1273,113 @@ mod tests {
         assert!(!valid_redirect_uri(&state, "https://trusted.example/cb"));
         assert!(!valid_redirect_uri(&state, "https://evil.example/cb"));
         assert!(!valid_redirect_uri(&state, "http://127.0.0.1:1455/cb"));
+    }
+
+    #[tokio::test]
+    async fn standalone_database_is_created_and_legacy_rows_are_preserved_once() {
+        let legacy = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("legacy sqlite");
+        for statement in [
+            "CREATE TABLE oauth_clients(client_id TEXT PRIMARY KEY,client_secret_hash TEXT,redirect_uris TEXT NOT NULL,token_endpoint_auth_method TEXT NOT NULL,client_name TEXT,created_at TEXT NOT NULL)",
+            "CREATE TABLE oauth_codes(code_hash TEXT PRIMARY KEY,client_id TEXT NOT NULL,redirect_uri TEXT NOT NULL,code_challenge TEXT NOT NULL,resource TEXT NOT NULL,scope TEXT NOT NULL,expires_at TEXT NOT NULL,used INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE oauth_refresh_tokens(token_hash TEXT PRIMARY KEY,client_id TEXT NOT NULL,resource TEXT NOT NULL,scope TEXT NOT NULL,expires_at TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE oauth_access_tokens(token_hash TEXT PRIMARY KEY,client_id TEXT NOT NULL,resource TEXT NOT NULL,scope TEXT NOT NULL,expires_at TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL)",
+        ] {
+            sqlx::query(statement).execute(&legacy).await.unwrap();
+        }
+        sqlx::query("INSERT INTO oauth_clients VALUES('client-1','secret-hash','[\"https://example.com/cb\"]','client_secret_post','Example','2026-01-01T00:00:00Z')")
+            .execute(&legacy).await.unwrap();
+        sqlx::query("INSERT INTO oauth_codes VALUES('code-hash','client-1','https://example.com/cb','challenge','https://mcp.example.com/mcp','test','2026-01-01T00:10:00Z',1)")
+            .execute(&legacy).await.unwrap();
+        sqlx::query("INSERT INTO oauth_refresh_tokens VALUES('refresh-hash','client-1','https://mcp.example.com/mcp','test','2026-02-01T00:00:00Z',1)")
+            .execute(&legacy).await.unwrap();
+        sqlx::query("INSERT INTO oauth_access_tokens VALUES('access-hash','client-1','https://mcp.example.com/mcp','test','2026-01-01T01:00:00Z',0,'2026-01-01T00:00:00Z')")
+            .execute(&legacy).await.unwrap();
+
+        let root = std::env::temp_dir().join(format!("oauth-storage-test-{}", Uuid::new_v4()));
+        let path = root.join("nested").join("oauth.db");
+        let cfg = config(None, RedirectPolicy::PublicMcp);
+        let first = OAuthState::open_migrating_legacy(&path, cfg.clone(), &legacy)
+            .await
+            .expect("open and import legacy data");
+        assert!(path.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT client_name FROM oauth_clients WHERE client_id='client-1'"
+            )
+            .fetch_one(&first.db)
+            .await
+            .unwrap(),
+            "Example"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT used FROM oauth_codes WHERE code_hash='code-hash'"
+            )
+            .fetch_one(&first.db)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT revoked FROM oauth_refresh_tokens WHERE token_hash='refresh-hash'"
+            )
+            .fetch_one(&first.db)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM oauth_access_tokens WHERE token_hash='access-hash'"
+            )
+            .fetch_one(&first.db)
+            .await
+            .unwrap(),
+            1
+        );
+        drop(first);
+
+        // Once cut over, later writes to the legacy application database must not
+        // overwrite or re-import into the crate-owned database.
+        sqlx::query(
+            "UPDATE oauth_clients SET client_name='stale legacy value' WHERE client_id='client-1'",
+        )
+        .execute(&legacy)
+        .await
+        .unwrap();
+        let reopened = OAuthState::open_migrating_legacy(
+            &path,
+            config(None, RedirectPolicy::PublicMcp),
+            &legacy,
+        )
+        .await
+        .expect("reopen standalone database");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT client_name FROM oauth_clients WHERE client_id='client-1'"
+            )
+            .fetch_one(&reopened.db)
+            .await
+            .unwrap(),
+            "Example"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT value FROM oauth_meta WHERE key='legacy_import_complete'"
+            )
+            .fetch_one(&reopened.db)
+            .await
+            .unwrap(),
+            "1"
+        );
+
+        drop(reopened);
+        drop(legacy);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

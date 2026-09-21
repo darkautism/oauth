@@ -2,7 +2,7 @@
 
 A small Rust OAuth 2.1 authorization server for MCP HTTP endpoints.
 
-It provides the OAuth pieces an MCP server commonly needs without requiring you to implement the protocol flow yourself.
+It provides the OAuth pieces an MCP server commonly needs without making the application own OAuth tables, migrations, or token storage.
 
 ## Features
 
@@ -12,70 +12,56 @@ It provides the OAuth pieces an MCP server commonly needs without requiring you 
 - Authorization Code flow with PKCE `S256`
 - Refresh tokens
 - Bearer-token validation for MCP routes
-- SQLite-backed clients, authorization codes, access tokens, and refresh tokens
+- Private SQLite storage managed by the crate
+- Automatic database creation and schema migration
 - Configurable redirect-URI policy
 - Optional external client metadata resolution
 
 ## Add it to your project
-
-The crate is currently consumed directly from Git:
 
 ```toml
 [dependencies]
 oauth = { git = "https://github.com/darkautism/oauth.git" }
 ```
 
-It uses Axum 0.8 and SQLx 0.8 with SQLite.
+The crate uses Axum 0.8 internally for its HTTP routes.
 
-## Database
+## Quick start
 
-Create the OAuth tables before serving requests. A ready-to-use schema is included at:
-
-```text
-migrations/0001_oauth.sql
-```
-
-The crate stores only hashes of access tokens, refresh tokens, authorization codes, and confidential-client secrets.
-
-## Minimal setup
+Choose where OAuth should keep its private database:
 
 ```rust
 use std::sync::Arc;
 
 use oauth::{OAuthConfig, OAuthState, RedirectPolicy, TokenPrefixes};
 
-let oauth_state = Arc::new(OAuthState::new(
-    sqlite_pool,
-    OAuthConfig {
-        service_name: "My MCP".into(),
-        scope: "my-mcp".into(),
-
-        // Prefer an explicit public URL in production.
-        public_url: Some("https://mcp.example.com".into()),
-
-        // Password shown by the built-in authorization form.
-        oauth_password: Some("replace-me".into()),
-
-        // Used only when public_url is not set.
-        default_host: "127.0.0.1:8080".into(),
-
-        // Controls generated client/code/token prefixes.
-        token_prefixes: TokenPrefixes::new("my"),
-
-        redirect_policy: RedirectPolicy::Restricted {
-            production: true,
-            allowed_hosts: vec![
-                "chatgpt.com".into(),
-                "*.example.com".into(),
-            ],
+let oauth_state = Arc::new(
+    OAuthState::open(
+        "./data/oauth.db",
+        OAuthConfig {
+            service_name: "My MCP".into(),
+            scope: "my-mcp".into(),
+            public_url: Some("https://mcp.example.com".into()),
+            oauth_password: Some("replace-me".into()),
+            default_host: "127.0.0.1:8080".into(),
+            token_prefixes: TokenPrefixes::new("my"),
+            redirect_policy: RedirectPolicy::Restricted {
+                production: true,
+                allowed_hosts: vec![
+                    "chatgpt.com".into(),
+                    "*.example.com".into(),
+                ],
+            },
+            client_id_metadata_document_supported: false,
         },
-
-        client_id_metadata_document_supported: false,
-    },
-));
+    )
+    .await?,
+);
 ```
 
-Mount the OAuth routes into your Axum application:
+That path belongs to the OAuth crate. If the directory or database file does not exist, it is created automatically. The crate creates and migrates its own schema; your application does not provide a SQLx pool or maintain OAuth tables.
+
+Mount the OAuth endpoints:
 
 ```rust
 let app = axum::Router::new()
@@ -98,7 +84,7 @@ This adds:
 
 ## Protect an MCP route
 
-Apply `require_mcp_auth` only to the MCP routes that require a bearer token:
+Apply `require_mcp_auth` to the MCP routes that require a bearer token:
 
 ```rust
 use axum::{middleware, Router};
@@ -116,6 +102,35 @@ let app = Router::new()
 ```
 
 Requests without a valid token receive `401 Unauthorized` with an MCP-compatible `WWW-Authenticate` header pointing at the protected-resource metadata.
+
+## Storage
+
+The application chooses only the database path:
+
+```rust
+OAuthState::open("/var/lib/my-service/oauth.db", config).await?
+```
+
+Everything inside that database is private implementation state of this crate. Applications should not query or migrate it themselves.
+
+When a future crate version changes its schema, `OAuthState::open` applies the embedded migrations before serving requests.
+
+### Migrating an older embedded OAuth database
+
+If an older version of your application stored OAuth tables inside its own SQLite database, use the one-time migration constructor during the upgrade:
+
+```rust
+let oauth_state = OAuthState::open_migrating_legacy(
+    "./data/oauth.db",
+    config,
+    &old_application_pool,
+)
+.await?;
+```
+
+The old database is read-only from this migration's point of view. Existing OAuth rows are copied transactionally into the new private database, and the import is marked complete only after every table succeeds. The old rows are left untouched so a failed upgrade does not destroy the source data.
+
+After a successful import, later starts use only the private OAuth database.
 
 ## Redirect policies
 
@@ -136,7 +151,7 @@ In non-production mode, an empty allow-list permits HTTPS redirects and loopback
 
 ## External client metadata
 
-If some client IDs should be resolved outside the local `oauth_clients` table, implement `ExternalClientResolver`:
+If some client IDs should be resolved outside the local client store, implement `ExternalClientResolver`:
 
 ```rust
 use async_trait::async_trait;
@@ -168,13 +183,14 @@ impl ExternalClientResolver for MyResolver {
 Attach it when constructing the state:
 
 ```rust
-let oauth_state = OAuthState::new(sqlite_pool, config)
+let oauth_state = OAuthState::open("./data/oauth.db", config)
+    .await?
     .with_external_client_resolver(Arc::new(MyResolver));
 
 let oauth_state = Arc::new(oauth_state);
 ```
 
-The resolver is consulted only when a client ID is not found in the local database.
+The resolver is consulted only when a client ID is not found in the crate's local client store.
 
 ## Configuration reference
 
@@ -189,9 +205,9 @@ The resolver is consulted only when a client ID is not found in the local databa
 | `redirect_policy` | Redirect-URI validation policy |
 | `client_id_metadata_document_supported` | Advertise external client metadata support |
 
-## Current storage and token lifetimes
+## Token lifetimes
 
-The current implementation uses SQLite and fixed lifetimes:
+The current defaults are:
 
 - authorization code: 10 minutes
 - access token: 1 hour
