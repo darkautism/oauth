@@ -760,13 +760,151 @@ async fn authorize_get(
 
     let service = esc(&state.config.service_name);
     let form = format!(
-        r#"<!doctype html><meta charset="utf-8"><title>Authorize {}</title>
-<style>body{{font-family:sans-serif;max-width:42rem;margin:4rem auto;padding:0 1rem}}input{{width:100%;padding:.7rem;margin:.4rem 0}}button{{padding:.7rem 1rem}}</style>
-<h1>Authorize {} MCP</h1><p>Client: <code>{}</code></p><form method="post" action="/mcp/oauth/authorize">
-<input type="hidden" name="client_id" value="{}"><input type="hidden" name="redirect_uri" value="{}">
-<input type="hidden" name="code_challenge" value="{}"><input type="hidden" name="code_challenge_method" value="{}">
-<input type="hidden" name="state" value="{}"><input type="hidden" name="resource" value="{}"><input type="hidden" name="scope" value="{}">
-<label>{} password</label><input type="password" name="password" autofocus required><button type="submit">Authorize</button></form>"#,
+        r#"<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize {}</title>
+<style>
+  :root {{
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --text: #1a1d23;
+    --muted: #6b7280;
+    --border: #e2e4e9;
+    --accent: #2f6feb;
+    --accent-hover: #2557c4;
+    --danger: #d1373f;
+    color-scheme: light dark;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --bg: #0f1115;
+      --card: #181b21;
+      --text: #e7e9ee;
+      --muted: #9198a6;
+      --border: #2a2e37;
+      --accent: #5b8cff;
+      --accent-hover: #7ca0ff;
+    }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }}
+  .card {{
+    width: 100%;
+    max-width: 24rem;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 2rem 1.75rem;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 8px 24px rgba(16, 24, 40, .08);
+  }}
+  .badge {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.75rem;
+    height: 2.75rem;
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+    margin-bottom: 1rem;
+  }}
+  h1 {{
+    font-size: 1.25rem;
+    font-weight: 650;
+    margin: 0 0 .35rem;
+    letter-spacing: -.01em;
+  }}
+  .subtitle {{
+    margin: 0 0 1.5rem;
+    color: var(--muted);
+    font-size: .9rem;
+    line-height: 1.45;
+  }}
+  .subtitle code {{
+    background: color-mix(in srgb, var(--muted) 14%, transparent);
+    padding: .1rem .4rem;
+    border-radius: 6px;
+    font-size: .82rem;
+    word-break: break-all;
+  }}
+  label {{
+    display: block;
+    font-size: .82rem;
+    font-weight: 600;
+    margin-bottom: .4rem;
+    color: var(--text);
+  }}
+  input[type=password] {{
+    width: 100%;
+    padding: .7rem .8rem;
+    font-size: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    color: var(--text);
+    outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }}
+  input[type=password]:focus {{
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+  }}
+  button {{
+    width: 100%;
+    margin-top: 1.1rem;
+    padding: .75rem 1rem;
+    font-size: .95rem;
+    font-weight: 600;
+    color: #fff;
+    background: var(--accent);
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background .15s;
+  }}
+  button:hover {{ background: var(--accent-hover); }}
+  button:active {{ transform: translateY(1px); }}
+  .footer {{
+    margin-top: 1.25rem;
+    text-align: center;
+    font-size: .78rem;
+    color: var(--muted);
+  }}
+</style>
+<div class="card">
+  <div class="badge">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="11" width="18" height="11" rx="2"></rect>
+      <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+    </svg>
+  </div>
+  <h1>Authorize {}</h1>
+  <p class="subtitle">An application is requesting access. Client: <code>{}</code></p>
+  <form method="post" action="/mcp/oauth/authorize">
+    <input type="hidden" name="client_id" value="{}">
+    <input type="hidden" name="redirect_uri" value="{}">
+    <input type="hidden" name="code_challenge" value="{}">
+    <input type="hidden" name="code_challenge_method" value="{}">
+    <input type="hidden" name="state" value="{}">
+    <input type="hidden" name="resource" value="{}">
+    <input type="hidden" name="scope" value="{}">
+    <label for="pw">{} password</label>
+    <input id="pw" type="password" name="password" autocomplete="current-password" autofocus required>
+    <button type="submit">Authorize</button>
+  </form>
+  <p class="footer">Only continue if you trust this application.</p>
+</div>"#,
         service,
         service,
         esc(&params.client_id),
