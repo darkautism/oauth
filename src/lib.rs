@@ -95,6 +95,7 @@ pub trait ExternalClientResolver: Send + Sync {
 pub struct OAuthState {
     db: sqlx::SqlitePool,
     pub config: OAuthConfig,
+    redirect_policy: std::sync::RwLock<RedirectPolicy>,
     pub external_client_resolver: Option<Arc<dyn ExternalClientResolver>>,
 }
 
@@ -132,9 +133,11 @@ impl OAuthState {
             .await?;
         sqlx::migrate!("./migrations").run(&db).await?;
 
+        let redirect_policy = config.redirect_policy.clone();
         Ok(Self {
             db,
             config,
+            redirect_policy: std::sync::RwLock::new(redirect_policy),
             external_client_resolver: None,
         })
     }
@@ -145,6 +148,21 @@ impl OAuthState {
     ) -> Self {
         self.external_client_resolver = Some(resolver);
         self
+    }
+
+    pub fn set_redirect_policy(&self, policy: RedirectPolicy) {
+        let mut guard = self
+            .redirect_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = policy;
+    }
+
+    fn redirect_policy(&self) -> RedirectPolicy {
+        self.redirect_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -389,7 +407,8 @@ fn valid_redirect_uri(state: &OAuthState, raw: &str) -> bool {
         return false;
     };
 
-    match &state.config.redirect_policy {
+    let redirect_policy = state.redirect_policy();
+    match &redirect_policy {
         RedirectPolicy::PublicMcp => match url.scheme() {
             "https" => true,
             "http" => matches!(host, "127.0.0.1" | "localhost" | "::1"),
@@ -1452,9 +1471,11 @@ mod tests {
 
     fn state(public_url: Option<&str>, redirect_policy: RedirectPolicy) -> OAuthState {
         let db = sqlx::SqlitePool::connect_lazy("sqlite::memory:").expect("lazy sqlite");
+        let config = config(public_url, redirect_policy.clone());
         OAuthState {
             db,
-            config: config(public_url, redirect_policy),
+            config,
+            redirect_policy: std::sync::RwLock::new(redirect_policy),
             external_client_resolver: None,
         }
     }
@@ -1526,6 +1547,29 @@ mod tests {
         assert!(!valid_redirect_uri(&state, "https://trusted.example/cb"));
         assert!(!valid_redirect_uri(&state, "https://evil.example/cb"));
         assert!(!valid_redirect_uri(&state, "http://127.0.0.1:1455/cb"));
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_can_be_updated_without_reopening_state() {
+        let state = state(
+            None,
+            RedirectPolicy::Restricted {
+                production: true,
+                allowed_hosts: vec!["chatgpt.com".into()],
+            },
+        );
+        assert!(!valid_redirect_uri(
+            &state,
+            "https://claude.ai/api/mcp/auth_callback"
+        ));
+        state.set_redirect_policy(RedirectPolicy::Restricted {
+            production: true,
+            allowed_hosts: vec!["chatgpt.com".into(), "claude.ai".into()],
+        });
+        assert!(valid_redirect_uri(
+            &state,
+            "https://claude.ai/api/mcp/auth_callback"
+        ));
     }
 
     #[tokio::test]
