@@ -60,8 +60,8 @@ impl TokenPrefixes {
 pub enum RedirectPolicy {
     /// Accept any HTTPS redirect URI plus HTTP loopback redirects.
     PublicMcp,
-    /// Require explicitly allowed HTTPS hosts in production. Loopback HTTP
-    /// redirect URIs remain allowed for native/desktop OAuth clients in all modes.
+    /// Require explicitly allowed HTTPS hosts in production. In development,
+    /// an empty allow-list accepts HTTPS hosts and loopback HTTP.
     Restricted {
         production: bool,
         allowed_hosts: Vec<String>,
@@ -396,20 +396,6 @@ async fn register_client(
     Ok((StatusCode::CREATED, Json(out)))
 }
 
-fn is_loopback_redirect_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let unbracketed = host
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host);
-    unbracketed
-        .parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
-}
-
 fn valid_redirect_uri(state: &OAuthState, raw: &str) -> bool {
     let Ok(url) = Url::parse(raw) else {
         return false;
@@ -425,7 +411,7 @@ fn valid_redirect_uri(state: &OAuthState, raw: &str) -> bool {
     match &redirect_policy {
         RedirectPolicy::PublicMcp => match url.scheme() {
             "https" => true,
-            "http" => is_loopback_redirect_host(host),
+            "http" => matches!(host, "127.0.0.1" | "localhost" | "::1"),
             _ => false,
         },
         RedirectPolicy::Restricted {
@@ -433,11 +419,10 @@ fn valid_redirect_uri(state: &OAuthState, raw: &str) -> bool {
             allowed_hosts,
         } => match url.scheme() {
             "https" => host_allowed(*production, allowed_hosts, host),
-            // RFC 8252 loopback redirects are the standard OAuth callback for
-            // native/desktop clients. They are safe to allow in production
-            // because the host must resolve to the loopback interface; the
-            // random port is selected by the local client.
-            "http" => is_loopback_redirect_host(host),
+            "http" if !*production => {
+                matches!(host, "127.0.0.1" | "localhost" | "::1")
+                    && (allowed_hosts.is_empty() || host_allowed(false, allowed_hosts, host))
+            }
             _ => false,
         },
     }
@@ -1561,11 +1546,7 @@ mod tests {
         assert!(valid_redirect_uri(&state, "https://a.trusted.example/cb"));
         assert!(!valid_redirect_uri(&state, "https://trusted.example/cb"));
         assert!(!valid_redirect_uri(&state, "https://evil.example/cb"));
-        assert!(valid_redirect_uri(&state, "http://127.0.0.1:1455/cb"));
-        assert!(valid_redirect_uri(&state, "http://localhost:1455/cb"));
-        assert!(valid_redirect_uri(&state, "http://[::1]:1455/cb"));
-        assert!(!valid_redirect_uri(&state, "http://127.0.0.1.evil.example:1455/cb"));
-        assert!(!valid_redirect_uri(&state, "http://192.168.1.10:1455/cb"));
+        assert!(!valid_redirect_uri(&state, "http://127.0.0.1:1455/cb"));
     }
 
     #[tokio::test]
